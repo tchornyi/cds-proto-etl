@@ -9,10 +9,14 @@ from psycopg.types.json import Jsonb
 
 from google_trends_etl.transform import TrendRecord
 
+# One row per (term, trend_date): a term seen again on the same UTC day
+# refreshes the existing row; the first appearance on a new day inserts a
+# fresh one, preserving per-day trend history.
 INSERT_SQL = """
 INSERT INTO current_trends (
     snapshot_id,
     snapshot_at,
+    trend_date,
     rank,
     term,
     search_volume,
@@ -22,6 +26,7 @@ INSERT INTO current_trends (
 ) VALUES (
     %(snapshot_id)s,
     %(snapshot_at)s,
+    %(trend_date)s,
     %(rank)s,
     %(term)s,
     %(search_volume)s,
@@ -29,6 +34,14 @@ INSERT INTO current_trends (
     %(trend_started_at)s,
     %(related_queries)s
 )
+ON CONFLICT (term, trend_date) DO UPDATE SET
+    snapshot_id = EXCLUDED.snapshot_id,
+    snapshot_at = EXCLUDED.snapshot_at,
+    rank = EXCLUDED.rank,
+    search_volume = EXCLUDED.search_volume,
+    volume_growth_pct = EXCLUDED.volume_growth_pct,
+    trend_started_at = COALESCE(EXCLUDED.trend_started_at, current_trends.trend_started_at),
+    related_queries = EXCLUDED.related_queries
 """
 
 
@@ -50,6 +63,7 @@ def _as_params(record: TrendRecord) -> dict[str, Any]:
     return {
         "snapshot_id": record.snapshot_id,
         "snapshot_at": record.snapshot_at,
+        "trend_date": record.trend_date,
         "rank": record.rank,
         "term": record.term,
         "search_volume": record.search_volume,

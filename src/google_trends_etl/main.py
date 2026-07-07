@@ -27,10 +27,14 @@ def run(
 
     with connect(settings) as conn:
         if not skip_migrations:
-            apply_migrations(conn)
+            apply_migrations(conn, local_tz=settings.trends_timezone)
 
         raw_entries = extract_trends(settings.trends_geo)
-        records = transform_trends(raw_entries, top_n=settings.trends_top_n)
+        records = transform_trends(
+            raw_entries,
+            top_n=settings.trends_top_n,
+            local_tz=settings.trends_timezone,
+        )
 
         if len(records) < settings.trends_top_n:
             LOGGER.warning(

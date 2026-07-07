@@ -11,6 +11,9 @@ dependencies = [
     "psycopg[binary]>=3.2,<4",
     "python-dotenv>=1.0,<2",
     "trendspy==0.1.6",
+    # IANA tz database for zoneinfo on platforms without a system copy
+    # (Windows, slim Docker images).
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]

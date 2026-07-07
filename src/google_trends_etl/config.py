@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import tzinfo
 from types import MappingProxyType
 from typing import Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -20,6 +22,9 @@ class Settings:
     pg_params: Mapping[str, str]
     trends_geo: str
     trends_top_n: int
+    # Timezone used to bucket trends into trend_date days; None means the
+    # system's local timezone at snapshot time.
+    trends_timezone: tzinfo | None
     pre_load_sleep_seconds: float
 
 
@@ -34,6 +39,7 @@ def load_settings(*, geo_override: str | None = None) -> Settings:
         raise ConfigError("TRENDS_GEO must not be empty.")
 
     trends_top_n = _parse_top_n()
+    trends_timezone = _parse_timezone("TRENDS_TIMEZONE")
     pre_load_sleep_seconds = _parse_non_negative_float(
         "PRE_LOAD_SLEEP_SECONDS",
         default="20",
@@ -44,6 +50,7 @@ def load_settings(*, geo_override: str | None = None) -> Settings:
         pg_params=pg_params,
         trends_geo=trends_geo,
         trends_top_n=trends_top_n,
+        trends_timezone=trends_timezone,
         pre_load_sleep_seconds=pre_load_sleep_seconds,
     )
 
@@ -91,6 +98,18 @@ def _parse_top_n() -> int:
     if value > 25:
         raise ConfigError("TRENDS_TOP_N must be between 1 and 25.")
     return value
+
+
+def _parse_timezone(name: str) -> tzinfo | None:
+    raw_value = _non_empty(name)
+    if raw_value is None:
+        return None
+    try:
+        return ZoneInfo(raw_value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError(
+            f"{name} must be an IANA timezone name (e.g. Europe/Kyiv), got {raw_value!r}."
+        ) from exc
 
 
 def _parse_non_negative_float(name: str, *, default: str) -> float:

@@ -5,9 +5,12 @@ Guidance for Agents (and humans) working in this repository.
 ## What this is
 
 A small, self-contained **ETL** that takes a point-in-time **snapshot** of the
-top 25 trending Google searches and stores them in PostgreSQL. Each run inserts
-25 rows (rank 1–25), all sharing a single `snapshot_id` / `snapshot_at`, into
-the table **`current_trends`**.
+top 25 trending Google searches and stores them in PostgreSQL. Each run upserts
+up to 25 rows (rank 1–25), all sharing a single `snapshot_id` / `snapshot_at`,
+into the table **`current_trends`**. The table keeps one row per term per
+local calendar day (`trend_date`, bucketed by `TRENDS_TIMEZONE`, default
+system timezone): a rerun on the same day refreshes that day's row, a new day
+inserts a fresh one — per-day trend history.
 
 - **Extract** — `extract.py`: fetches the "Trending Now" feed via
   [trendspy](https://pypi.org/project/trendspy/) (Google Trends has no official
@@ -17,7 +20,8 @@ the table **`current_trends`**.
   `TrendRecord` dataclasses: rank (1–25), search term, **approximate search
   volume**, volume growth %, related queries (JSONB), trend start time. Truncates
   the feed to the top 25 by rank. All timestamps made timezone-aware before insert.
-- **Load** — `load.py`: one bulk `executemany` insert inside a single transaction.
+- **Load** — `load.py`: one bulk `executemany` upsert (`ON CONFLICT
+  (term, trend_date)`) inside a single transaction.
 - **Migrate** — `migrate.py`: forward-only SQL migration runner; tracks applied
   files in `schema_migrations`. `current_trends` is created here, never by hand.
 
@@ -69,6 +73,8 @@ Pipeline settings:
 
 - `TRENDS_GEO` — two-letter geo code for the trending feed (default: `US`).
 - `TRENDS_TOP_N` — how many top trends to keep (default: `25`).
+- `TRENDS_TIMEZONE` — IANA timezone for `trend_date` day bucketing
+  (e.g. `Europe/Kyiv`; default: system local timezone).
 
 A local `.env` is auto-loaded; real environment variables always override it.
 Fail fast with a clear message when required variables are missing.
@@ -76,8 +82,10 @@ Fail fast with a clear message when required variables are missing.
 
 ## Schema (`current_trends`)
 
-- `snapshot_id UUID`, `snapshot_at TIMESTAMPTZ` — shared by all rows of one run.
-- `rank SMALLINT` — 1–25 position in the trending list at snapshot time.
+- `snapshot_id UUID`, `snapshot_at TIMESTAMPTZ` — last run that touched the row.
+- `trend_date DATE` — local day the term trended (`TRENDS_TIMEZONE`); PK is
+  `(term, trend_date)`.
+- `rank SMALLINT` — 1–25 position in the trending list at last refresh.
 - `term TEXT` — the trending search query.
 - `search_volume INTEGER` — approximate search volume as reported by Google
   (e.g. the "500K+" figures, normalised to an integer lower bound).
@@ -88,9 +96,13 @@ Fail fast with a clear message when required variables are missing.
 ## Conventions
 
 - **Schema changes go through migrations.** Add the next `NNN_*.sql`; never edit
-  an applied migration or alter tables by hand.
-- Each run is an immutable snapshot — append-only, never updates/deletes. Trend
-  history is reconstructed by querying across snapshots, not by updating rows.
+  an applied migration or alter tables by hand. The runner applies files with
+  the session `TimeZone` set from `TRENDS_TIMEZONE` (falling back to the
+  host's UTC offset), so `timestamptz::date` casts in migrations bucket to
+  local days.
+- One row per `(term, trend_date)` — a same-day rerun updates that day's row
+  (volume, timestamps, rank, growth, related queries); a new local day inserts
+  a new row. Rows are never deleted; history is queried by `trend_date`.
 - Timestamps stored as `TIMESTAMPTZ`; make them timezone-aware in transform.
 - A single trend entry failing to transform is logged and skipped, not fatal;
   a failing extract or load is fatal. Fewer than 25 rows in a snapshot is

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 import psycopg
 
@@ -27,11 +29,19 @@ def apply_migrations(
     conn: psycopg.Connection[Any],
     *,
     migrations_dir: Path = MIGRATIONS_DIR,
+    local_tz: tzinfo | None = None,
 ) -> list[str]:
     migration_files = sorted(migrations_dir.glob("*.sql"))
     applied_now: list[str] = []
 
     with conn.transaction():
+        # Migrations that cast timestamptz to date (e.g. 003) must land on the
+        # configured local day. set_config(..., true) is transaction-local, so
+        # the session default returns after commit.
+        conn.execute(
+            "SELECT set_config('TimeZone', %s, true)",
+            (_postgres_timezone(local_tz),),
+        )
         conn.execute(SCHEMA_MIGRATIONS_SQL)
         applied = {
             row[0]
@@ -69,8 +79,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
 
     with connect(settings) as conn:
-        apply_migrations(conn)
+        apply_migrations(conn, local_tz=settings.trends_timezone)
     return 0
+
+
+def _postgres_timezone(local_tz: tzinfo | None) -> str:
+    if isinstance(local_tz, ZoneInfo):
+        return local_tz.key
+    if local_tz is None:
+        local_tz = datetime.now().astimezone().tzinfo
+    offset = datetime.now(local_tz).utcoffset() or timedelta(0)
+    minutes = round(offset.total_seconds() / 60)
+    LOGGER.warning(
+        "TRENDS_TIMEZONE is not set; using fixed offset UTC%+d:%02d for "
+        "migration date bucketing. Set an IANA timezone for DST-correct history.",
+        minutes // 60 if minutes >= 0 else -(-minutes // 60),
+        abs(minutes) % 60,
+    )
+    # POSIX zone syntax inverts the sign: local UTC+3 is written "UTC-3".
+    sign = "-" if minutes >= 0 else "+"
+    hours, remainder = divmod(abs(minutes), 60)
+    suffix = f"{hours}" + (f":{remainder:02d}" if remainder else "")
+    return f"UTC{sign}{suffix}"
 
 
 def _configure_logging(level: str) -> None:

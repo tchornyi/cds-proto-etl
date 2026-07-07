@@ -7,7 +7,7 @@ import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, tzinfo
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -62,6 +62,7 @@ class TransformError(ValueError):
 class TrendRecord:
     snapshot_id: UUID
     snapshot_at: datetime
+    trend_date: date
     rank: int
     term: str
     search_volume: int
@@ -76,23 +77,34 @@ def transform_trends(
     top_n: int = 25,
     snapshot_id: UUID | None = None,
     snapshot_at: datetime | None = None,
+    local_tz: tzinfo | None = None,
 ) -> list[TrendRecord]:
     snapshot_id = snapshot_id or uuid4()
     snapshot_at = _make_aware(snapshot_at or datetime.now(UTC))
 
     records: list[TrendRecord] = []
+    seen_terms: set[str] = set()
     for rank, entry in enumerate(list(raw_entries)[:top_n], start=1):
         try:
-            records.append(
-                transform_entry(
-                    entry,
-                    rank=rank,
-                    snapshot_id=snapshot_id,
-                    snapshot_at=snapshot_at,
-                )
+            record = transform_entry(
+                entry,
+                rank=rank,
+                snapshot_id=snapshot_id,
+                snapshot_at=snapshot_at,
+                local_tz=local_tz,
             )
         except TransformError:
             LOGGER.exception("Skipping trend entry at rank %s.", rank)
+            continue
+
+        # The load upsert conflicts on (term, trend_date); a term repeated in
+        # one batch would make ON CONFLICT hit the same row twice, which
+        # PostgreSQL rejects. Keep the best-ranked occurrence.
+        if record.term in seen_terms:
+            LOGGER.warning("Skipping duplicate term %r at rank %s.", record.term, rank)
+            continue
+        seen_terms.add(record.term)
+        records.append(record)
 
     return records
 
@@ -103,6 +115,7 @@ def transform_entry(
     rank: int,
     snapshot_id: UUID,
     snapshot_at: datetime,
+    local_tz: tzinfo | None = None,
 ) -> TrendRecord:
     if not 1 <= rank <= 25:
         raise TransformError(f"Rank must be between 1 and 25, got {rank}.")
@@ -113,9 +126,11 @@ def transform_entry(
     trend_started_at = _parse_optional_datetime(_first_present(entry, STARTED_FIELDS, default=None))
     related_queries = _parse_related_queries(_first_present(entry, RELATED_FIELDS, default=None))
 
+    snapshot_at = _make_aware(snapshot_at)
     return TrendRecord(
         snapshot_id=snapshot_id,
-        snapshot_at=_make_aware(snapshot_at),
+        snapshot_at=snapshot_at,
+        trend_date=_local_date(snapshot_at, local_tz),
         rank=rank,
         term=term,
         search_volume=search_volume,
@@ -228,6 +243,14 @@ def _parse_optional_datetime(value: Any) -> datetime | None:
         return _make_aware(datetime.fromisoformat(text))
     except ValueError:
         raise TransformError(f"Could not parse trend start time from {value!r}.")
+
+
+def _local_date(snapshot_at: datetime, local_tz: tzinfo | None) -> date:
+    # trend_date buckets rows into local calendar days; snapshot_at itself
+    # stays UTC. No tz configured -> the system's local timezone.
+    if local_tz is None:
+        return snapshot_at.astimezone().date()
+    return snapshot_at.astimezone(local_tz).date()
 
 
 def _make_aware(value: datetime) -> datetime:
